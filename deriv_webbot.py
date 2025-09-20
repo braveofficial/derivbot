@@ -1,5 +1,5 @@
 # deriv_webbot.py
-# Streamlit DBot-style bulk trader with live balance display, customizable number of trades per batch, and theme toggle
+# Streamlit MASTER BULK TRADER with live balance display, customizable number of trades per batch, and theme toggle
 # Requirements:
 #   pip install streamlit websocket-client
 
@@ -10,7 +10,7 @@ import threading
 import time
 import datetime
 
-st.set_page_config(page_title="Deriv Bulk WebBot", layout="wide")
+st.set_page_config(page_title="MASTER BULK TRADER", layout="wide")
 
 # ---------------------
 # Session defaults
@@ -344,7 +344,7 @@ def main_ui():
     # header + theme toggle
     header_col1, header_col2 = st.columns([6,1])
     with header_col1:
-        st.title("📊 Deriv Bulk WebBot - DBot Style (Bulk Custom)")
+        st.title("💎 MASTER BULK TRADER")
     with header_col2:
         theme_choice = st.radio("Theme", ("Light","Dark"), index=0 if st.session_state.theme=="light" else 1, horizontal=True)
         if theme_choice.lower() != st.session_state.theme:
