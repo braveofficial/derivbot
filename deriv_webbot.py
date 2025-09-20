@@ -1,5 +1,5 @@
 # deriv_webbot.py
-# Streamlit DBot-style bulk trader with Debug Mode & theme toggle
+# Streamlit DBot-style bulk trader with live balance display, customizable number of trades per batch, and theme toggle
 # Requirements:
 #   pip install streamlit websocket-client
 
@@ -10,7 +10,7 @@ import threading
 import time
 import datetime
 
-st.set_page_config(page_title="Deriv Bulk WebBot (Debug)", layout="wide")
+st.set_page_config(page_title="Deriv Bulk WebBot", layout="wide")
 
 # ---------------------
 # Session defaults
@@ -23,14 +23,12 @@ if "stats" not in st.session_state:
     st.session_state.stats = {"stake_total": 0.0, "payout_total": 0.0, "wins": 0, "losses": 0, "profit": 0.0}
 if "lock" not in st.session_state:
     st.session_state.lock = threading.Lock()
-if "debug_enabled" not in st.session_state:
-    st.session_state.debug_enabled = False
-if "debug_messages_raw" not in st.session_state:
-    st.session_state.debug_messages_raw = []  # list of raw strings
-if "debug_messages_html" not in st.session_state:
-    st.session_state.debug_messages_html = []  # list of formatted html lines
 if "theme" not in st.session_state:
     st.session_state.theme = "light"
+if "balance" not in st.session_state:
+    st.session_state.balance = None
+if "account_currency" not in st.session_state:
+    st.session_state.account_currency = "USD"
 
 # ---------------------
 # Markets
@@ -62,7 +60,6 @@ body {background-color: #f8f9fb; color: #111;}
 .info { color: #444; }
 .header { font-size:18px; font-weight:700; }
 .small { font-size:12px; color:#666; }
-.debug-box { background:#0f1720; color:#e6eef6; padding:8px; border-radius:6px; font-family:monospace; white-space:pre-wrap; overflow:auto; max-height:300px;}
 </style>
 """
 DARK_CSS = """
@@ -74,7 +71,6 @@ body {background-color: #0f1720; color: #e6eef6;}
 .info { color: #94a3b8; }
 .header { font-size:18px; font-weight:700; }
 .small { font-size:12px; color:#94a3b8; }
-.debug-box { background:#010414; color:#bfe6d8; padding:8px; border-radius:6px; font-family:monospace; white-space:pre-wrap; overflow:auto; max-height:300px;}
 </style>
 """
 
@@ -104,33 +100,46 @@ def add_transaction(tr):
         elif pl < 0:
             st.session_state.stats["losses"] += 1
 
-def debug_log_raw(prefix, obj, level="info"):
-    """
-    prefix: arrow/string, obj: dict or string, level: 'info'|'success'|'error'
-    Stores raw (text) and formatted HTML for display & download.
-    """
-    if not st.session_state.debug_enabled:
-        return
-    ts = now_ts()
-    if isinstance(obj, (dict, list)):
-        payload = json.dumps(obj, indent=2, ensure_ascii=False)
-    else:
-        payload = str(obj)
-    line_raw = f"{ts} {prefix} {payload}"
-    st.session_state.debug_messages_raw.append(line_raw)
-    color = "#94a3b8"
-    if level == "success":
-        color = "#4CAF50"
-    elif level == "error":
-        color = "#FF5252"
-    # small HTML escape for safety in the payload viewing
-    html_payload = payload.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-    html_line = f"<div style='color:{color}; font-family:monospace; padding:2px;'><b>{ts} {prefix}</b><pre style='margin:0'>{html_payload}</pre></div>"
-    st.session_state.debug_messages_html.append(html_line)
-    # keep debug arrays capped at e.g. 2000 lines to avoid memory explosion
-    if len(st.session_state.debug_messages_raw) > 4000:
-        st.session_state.debug_messages_raw = st.session_state.debug_messages_raw[-2000:]
-        st.session_state.debug_messages_html = st.session_state.debug_messages_html[-2000:]
+# ---------------------
+# Live balance fetcher
+# ---------------------
+def fetch_account_balance(api_token, update_interval=3):
+    while st.session_state.running:
+        try:
+            ws = websocket.WebSocket()
+            ws.settimeout(8)
+            ws.connect("wss://ws.derivws.com/websockets/v3?app_id=1089")
+            auth_req = {"authorize": api_token}
+            ws.send(json.dumps(auth_req))
+            auth_resp_raw = ws.recv()
+            auth_resp = json.loads(auth_resp_raw)
+            if "error" in auth_resp:
+                # Show error balance
+                with st.session_state.lock:
+                    st.session_state.balance = None
+                ws.close()
+                time.sleep(update_interval)
+                continue
+            # fetch balance
+            bal_req = {"balance": 1, "currency": "USD"}
+            ws.send(json.dumps(bal_req))
+            bal_resp_raw = ws.recv()
+            bal_resp = json.loads(bal_resp_raw)
+            if "balance" in bal_resp:
+                balance = bal_resp["balance"].get("balance", None)
+                currency = bal_resp["balance"].get("currency", "USD")
+                with st.session_state.lock:
+                    st.session_state.balance = balance
+                    st.session_state.account_currency = currency
+            ws.close()
+        except Exception:
+            with st.session_state.lock:
+                st.session_state.balance = None
+            try:
+                ws.close()
+            except:
+                pass
+        time.sleep(update_interval)
 
 # ---------------------
 # Trade worker (single trade — one websocket per trade)
@@ -144,15 +153,12 @@ def trade_thread(api_token, symbol, contract_type, stake, digit, trade_no, timeo
 
     ws = None
     try:
-        debug_log_raw("→ CONNECT", f"Opening WS for trade #{trade_no}", "info")
         ws = websocket.WebSocket()
         ws.settimeout(8)
         ws.connect("wss://ws.derivws.com/websockets/v3?app_id=1089")
         auth_req = {"authorize": api_token}
-        debug_log_raw("→ SEND", auth_req, "info")
         ws.send(json.dumps(auth_req))
         auth_resp_raw = ws.recv()
-        debug_log_raw("← RECV", auth_resp_raw, "success")
         auth_resp = json.loads(auth_resp_raw)
         if "error" in auth_resp:
             add_transaction({
@@ -175,10 +181,7 @@ def trade_thread(api_token, symbol, contract_type, stake, digit, trade_no, timeo
         if contract_type in ["DIGITMATCH", "DIGITDIFF", "DIGITOVER", "DIGITUNDER"]:
             proposal["barrier"] = str(digit)
 
-        # send proposal
-        debug_log_raw("→ SEND", proposal, "info")
         ws.send(json.dumps(proposal))
-
         # wait for proposal response
         proposal_resp = None
         start = time.time()
@@ -187,7 +190,6 @@ def trade_thread(api_token, symbol, contract_type, stake, digit, trade_no, timeo
                 raw = ws.recv()
             except Exception:
                 continue
-            debug_log_raw("← RECV", raw, "info")
             try:
                 msg = json.loads(raw)
             except Exception:
@@ -201,7 +203,6 @@ def trade_thread(api_token, symbol, contract_type, stake, digit, trade_no, timeo
 
         if not proposal_resp or "error" in proposal_resp:
             err = proposal_resp.get("error") if proposal_resp else {"message": "No proposal"}
-            debug_log_raw("!!", f"Proposal error for trade #{trade_no}: {err}", "error")
             add_transaction({
                 "trade_no": trade_no, "entry": entry, "exit": exit_, "stake": stake,
                 "payout": payout, "pl": pl, "status": f"ProposalError: {err}"
@@ -209,11 +210,9 @@ def trade_thread(api_token, symbol, contract_type, stake, digit, trade_no, timeo
             return
 
         proposal_id = proposal_resp.get("id") or proposal_resp.get("proposal") or proposal_resp.get("proposal_id")
-        debug_log_raw("← INFO", {"proposal_id": proposal_id}, "success")
 
         # buy
         buy_req = {"buy": proposal_id}
-        debug_log_raw("→ SEND", buy_req, "info")
         ws.send(json.dumps(buy_req))
 
         # wait for buy response
@@ -225,7 +224,6 @@ def trade_thread(api_token, symbol, contract_type, stake, digit, trade_no, timeo
                 raw = ws.recv()
             except Exception:
                 continue
-            debug_log_raw("← RECV", raw, "info")
             try:
                 msg = json.loads(raw)
             except Exception:
@@ -240,14 +238,11 @@ def trade_thread(api_token, symbol, contract_type, stake, digit, trade_no, timeo
 
         if not buy_resp or "error" in buy_resp:
             err = buy_resp.get("error") if buy_resp else {"message": "No buy response"}
-            debug_log_raw("!!", f"Buy error for trade #{trade_no}: {err}", "error")
             add_transaction({
                 "trade_no": trade_no, "entry": entry, "exit": exit_, "stake": stake,
                 "payout": payout, "pl": pl, "status": f"BuyError: {err}"
             })
             return
-
-        debug_log_raw("← INFO", {"contract_id": contract_id}, "success")
 
         # wait for settlement
         start = time.time()
@@ -256,7 +251,6 @@ def trade_thread(api_token, symbol, contract_type, stake, digit, trade_no, timeo
                 raw = ws.recv()
             except Exception:
                 continue
-            debug_log_raw("← RECV", raw, "info")
             try:
                 msg = json.loads(raw)
             except Exception:
@@ -272,7 +266,6 @@ def trade_thread(api_token, symbol, contract_type, stake, digit, trade_no, timeo
                         entry = poc.get("entry_tick", "-")
                         exit_ = poc.get("exit_tick", "-")
                         status = "Win" if pl > 0 else ("Loss" if pl < 0 else "Even")
-                        debug_log_raw("← INFO", {"settled": {"buy": buy_price, "sell": sell_price, "pl": pl}}, "success")
                         break
             if "contract" in msg:
                 c = msg["contract"]
@@ -284,18 +277,15 @@ def trade_thread(api_token, symbol, contract_type, stake, digit, trade_no, timeo
                     entry = c.get("entry_tick", "-")
                     exit_ = c.get("exit_tick", "-")
                     status = "Win" if pl > 0 else ("Loss" if pl < 0 else "Even")
-                    debug_log_raw("← INFO", {"contract_settled": {"buy": buy_price, "sell": sell_price, "pl": pl}}, "success")
                     break
             if "sell" in msg:
                 s = msg["sell"]
                 payout = float(s.get("sell_price", s.get("profit", 0)) or 0)
                 pl = payout
                 status = "Win" if pl > 0 else ("Loss" if pl < 0 else "Even")
-                debug_log_raw("← INFO", {"sell_msg": s}, "success")
                 break
 
         if status == "Unknown":
-            debug_log_raw("!!", f"Trade #{trade_no} had no settlement within timeout", "error")
             add_transaction({
                 "trade_no": trade_no, "entry": entry, "exit": exit_, "stake": stake,
                 "payout": payout, "pl": pl, "status": "NoSettlement"
@@ -309,7 +299,6 @@ def trade_thread(api_token, symbol, contract_type, stake, digit, trade_no, timeo
         })
 
     except Exception as e:
-        debug_log_raw("!!", f"Exception in trade #{trade_no}: {e}", "error")
         add_transaction({
             "trade_no": trade_no, "entry": entry, "exit": exit_, "stake": stake,
             "payout": payout, "pl": pl, "status": f"Exception:{e}"
@@ -322,13 +311,13 @@ def trade_thread(api_token, symbol, contract_type, stake, digit, trade_no, timeo
             pass
 
 # ---------------------
-# Bulk batch runner (10 trades) -> spawns 10 threads
+# Bulk batch runner (custom trades) -> spawns batch_size threads
 # ---------------------
-def run_bulk_batch(api_token, symbol, contract_type, stake, digit):
+def run_bulk_batch(api_token, symbol, contract_type, stake, digit, batch_size):
     threads = []
     timestamp = now_ts()
     add_transaction({"trade_no": f"BatchStart_{timestamp}", "entry":"-","exit":"-","stake":0,"payout":0,"pl":0,"status":f"Starting batch @ {timestamp}"})
-    for i in range(1, 11):  # 10 trades per batch
+    for i in range(1, batch_size + 1):
         t = threading.Thread(target=trade_thread, args=(api_token, symbol, contract_type, stake, digit, i), daemon=True)
         t.start()
         threads.append(t)
@@ -340,11 +329,11 @@ def run_bulk_batch(api_token, symbol, contract_type, stake, digit):
 # ---------------------
 # Continuous runner
 # ---------------------
-def continuous_runner(api_token, symbol, contract_type, stake, digit):
+def continuous_runner(api_token, symbol, contract_type, stake, digit, batch_size):
     batch_no = 0
     while st.session_state.running:
         batch_no += 1
-        run_bulk_batch(api_token, symbol, contract_type, stake, digit)
+        run_bulk_batch(api_token, symbol, contract_type, stake, digit, batch_size)
         time.sleep(0.8)
     add_transaction({"trade_no":"System", "entry":"-","exit":"-","stake":0,"payout":0,"pl":0,"status":"Stopped continuous runner"})
 
@@ -355,7 +344,7 @@ def main_ui():
     # header + theme toggle
     header_col1, header_col2 = st.columns([6,1])
     with header_col1:
-        st.title("📊 Deriv Bulk WebBot - DBot Style (Bulk 10)")
+        st.title("📊 Deriv Bulk WebBot - DBot Style (Bulk Custom)")
     with header_col2:
         theme_choice = st.radio("Theme", ("Light","Dark"), index=0 if st.session_state.theme=="light" else 1, horizontal=True)
         if theme_choice.lower() != st.session_state.theme:
@@ -365,7 +354,7 @@ def main_ui():
     # layout
     left, center, right = st.columns([1,1.1,1.6])
 
-    # left: controls + debug toggle + download
+    # left: controls
     with left:
         st.subheader("⚙️ Controls")
         api_token = st.text_input("🔑 API Token", type="password")
@@ -378,18 +367,13 @@ def main_ui():
             digit = st.number_input("Digit (0-9)", min_value=0, max_value=9, value=5, step=1)
         else:
             digit = 0
+        batch_size = st.number_input("Number of trades per batch", min_value=1, max_value=100, value=10, step=1)
         continuous = st.checkbox("Repeat batches until STOP", value=True)
-        st.markdown("Note: Each batch fires 10 trades (parallel). Use demo token for testing.")
-
-        # Debug toggle
-        if st.checkbox("Enable Debug Mode", value=st.session_state.debug_enabled):
-            st.session_state.debug_enabled = True
-        else:
-            st.session_state.debug_enabled = False
+        st.markdown(f"Note: Each batch fires {batch_size} trades (parallel). Use demo token for testing.")
 
         # Start / Stop
         if not st.session_state.running:
-            if st.button("▶️ Start (Bulk 10)"):
+            if st.button(f"▶️ Start (Bulk {batch_size})"):
                 if not api_token:
                     st.error("Please enter API token")
                 else:
@@ -397,24 +381,33 @@ def main_ui():
                         st.session_state.transactions = []
                         st.session_state.stats = {"stake_total": 0.0, "payout_total": 0.0, "wins": 0, "losses": 0, "profit": 0.0}
                         st.session_state.running = True
-                        # clear debug logs when (re)starting
-                        st.session_state.debug_messages_raw = []
-                        st.session_state.debug_messages_html = []
+                    # Start balance fetcher thread
+                    threading.Thread(target=fetch_account_balance, args=(api_token,), daemon=True).start()
+                    # Start trading thread
                     if continuous:
-                        threading.Thread(target=continuous_runner, args=(api_token, custom_symbol, contract_type, stake, digit), daemon=True).start()
+                        threading.Thread(target=continuous_runner, args=(api_token, custom_symbol, contract_type, stake, digit, batch_size), daemon=True).start()
                     else:
-                        threading.Thread(target=run_bulk_batch, args=(api_token, custom_symbol, contract_type, stake, digit), daemon=True).start()
+                        threading.Thread(target=run_bulk_batch, args=(api_token, custom_symbol, contract_type, stake, digit, batch_size), daemon=True).start()
         else:
             if st.button("⏹️ Stop"):
                 st.session_state.running = False
 
-    # center: status + recent messages
+    # center: status + recent messages + live balance
     with center:
         st.subheader("🤖 Bot Status")
         if st.session_state.running:
             st.success("Bot is running (bulk batches)...")
         else:
             st.info("Bot is stopped.")
+
+        # Show live balance
+        balance = st.session_state.get("balance", None)
+        account_currency = st.session_state.get("account_currency", "USD")
+        if balance is not None:
+            st.metric("Account Balance", f"{account_currency} {balance:,.2f}")
+        else:
+            st.warning("Balance unavailable. Enter valid API token and start bot.")
+
         st.markdown("**Live actions / last messages**")
         recent = st.session_state.transactions[-6:] if st.session_state.transactions else []
         for item in reversed(recent):
@@ -425,27 +418,6 @@ def main_ui():
                 st.markdown(f"<div class='card loss'>{now_ts()} {text}</div>", unsafe_allow_html=True)
             else:
                 st.markdown(f"<div class='card info'>{now_ts()} {text}</div>", unsafe_allow_html=True)
-
-        # Debug expander (auto-expanded if debug enabled)
-        if st.session_state.debug_enabled:
-            debug_exp = st.expander("📡 Debug Log (raw WebSocket send/recv) — Auto-expanded", expanded=True)
-        else:
-            debug_exp = st.expander("📡 Debug Log (raw WebSocket send/recv)", expanded=False)
-
-        with debug_exp:
-            st.markdown("**Downloadable raw debug log**")
-            if st.session_state.debug_messages_raw:
-                st.download_button("📥 Download Debug Log", "\n".join(st.session_state.debug_messages_raw), file_name="debug_log.txt", mime="text/plain")
-            else:
-                st.write("No debug messages yet.")
-            st.markdown("---")
-            # Show formatted HTML debug messages with color
-            if st.session_state.debug_messages_html:
-                # display last 300 messages for performance
-                html_to_show = "\n".join(st.session_state.debug_messages_html[-300:])
-                st.markdown(f"<div class='debug-box'>{html_to_show}</div>", unsafe_allow_html=True)
-            else:
-                st.write("Debug messages will appear here when enabled.")
 
     # right: transactions list + session summary
     with right:
