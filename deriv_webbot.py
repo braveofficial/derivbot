@@ -5,6 +5,7 @@ import json
 import threading
 import time
 from datetime import datetime
+from urllib.parse import urlparse, parse_qs
 
 st.set_page_config(page_title="MASTER BULK TRADER", layout="wide")
 
@@ -61,9 +62,12 @@ if "balance" not in st.session_state:
     st.session_state.balance = 0.0
 if "trades" not in st.session_state:
     st.session_state.trades = []
+if "api_token" not in st.session_state:
+    st.session_state.api_token = None
 
 # ---------------- DERIV WEBSOCKET ---------------- #
-API_URL = "wss://ws.derivws.com/websockets/v3?app_id=1089"
+APP_ID = "102924"
+API_URL = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
 
 def authorize(ws, token):
     ws.send(json.dumps({"authorize": token}))
@@ -142,11 +146,11 @@ def ws_worker(token, symbol, contract_type, stake, target_digit):
     )
     ws.run_forever()
 
-def run_bot(token, symbol, contract_type, stake, target_digit, continuous):
+def run_bot(token, symbol, contract_type, stake, target_digit, continuous, bulk_runs):
     st.session_state.running = True
     while st.session_state.running:
         threads = []
-        for _ in range(10):
+        for _ in range(bulk_runs):   # ✅ user-chosen bulk runs
             t = threading.Thread(target=ws_worker, args=(token, symbol, contract_type, stake, target_digit))
             threads.append(t)
             t.start()
@@ -165,63 +169,84 @@ with col2:
     theme = st.radio("Theme", ["Light", "Dark"], horizontal=True, label_visibility="collapsed")
 apply_theme(theme, st.session_state.running)
 
-# API & Controls
-st.subheader("Controls")
-api_token = st.text_input("Enter your Deriv API Token", type="password")
+# OAuth Login
+st.subheader("Account Connection")
+query_params = st.experimental_get_query_params()
 
-symbols = {
-    "Volatility 10": "R_10",
-    "Volatility 25": "R_25",
-    "Volatility 50": "R_50",
-    "Volatility 75": "R_75",
-    "Volatility 100": "R_100",
-    "Volatility 10 (1s)": "R_10_1S",
-    "Volatility 15 (1s)": "R_15_1S",
-    "Volatility 25 (1s)": "R_25_1S",
-    "Volatility 50 (1s)": "R_50_1S",
-    "Volatility 75 (1s)": "R_75_1S",
-    "Volatility 90 (1s)": "R_90_1S",
-    "Volatility 100 (1s)": "R_100_1S"
-}
-symbol = st.selectbox("Market", list(symbols.keys()))
+# Handle login
+if "token" in query_params:
+    st.session_state.api_token = query_params["token"][0]
+    st.success("✅ Connected to Deriv successfully!")
 
-# Contract type + target digit in same row
-col1, col2 = st.columns([2,1])
-with col1:
-    contract_type = st.selectbox(
-        "Contract Type", 
-        ["DIGITMATCH", "DIGITDIFF", "DIGITOVER", "DIGITUNDER", "DIGITODD", "DIGITEVEN", "RISE", "FALL"]
-    )
-with col2:
-    target_digit = None
-    if contract_type in ["DIGITMATCH", "DIGITDIFF", "DIGITOVER", "DIGITUNDER"]:
-        target_digit = st.number_input("Digit", min_value=0, max_value=9, step=1)
-
-stake = st.number_input("Stake Amount (USD)", min_value=1.0, value=1.0)
-continuous = st.checkbox("Continuous Trading (Loop batches)")
-
-# Status
-st.subheader("Status")
-st.metric("Account Balance", f"${st.session_state.balance:,.2f}")
-
-# Trades table
-st.subheader("Recent Trades")
-if len(st.session_state.trades) > 0:
-    st.table(st.session_state.trades[:10])
+# Show login or logout option
+if st.session_state.api_token:
+    st.info("🔐 You are connected to your Deriv account.")
+    if st.button("🚪 Disconnect"):
+        st.session_state.api_token = None
+        st.session_state.running = False
+        st.session_state.balance = 0.0
+        st.session_state.trades = []
+        st.experimental_set_query_params()  # Clear token from URL
+        st.warning("You have been logged out. Please reconnect.")
 else:
-    st.write("No trades yet...")
+    oauth_url = f"https://oauth.deriv.com/oauth2/authorize?app_id={APP_ID}&scope=read,trade"
+    st.markdown(f"[🔗 Connect with Deriv]({oauth_url})", unsafe_allow_html=True)
 
-# Start / Stop
-col1, col2 = st.columns(2)
-with col1:
-    if st.button("▶️ Start"):
-        if not api_token:
-            st.error("Please enter API token")
-        else:
+# Trading Controls (only show if logged in)
+if st.session_state.api_token:
+    st.subheader("Controls")
+
+    symbols = {
+        "Volatility 10": "R_10",
+        "Volatility 25": "R_25",
+        "Volatility 50": "R_50",
+        "Volatility 75": "R_75",
+        "Volatility 100": "R_100",
+        "Volatility 10 (1s)": "R_10_1S",
+        "Volatility 15 (1s)": "R_15_1S",
+        "Volatility 25 (1s)": "R_25_1S",
+        "Volatility 50 (1s)": "R_50_1S",
+        "Volatility 75 (1s)": "R_75_1S",
+        "Volatility 90 (1s)": "R_90_1S",
+        "Volatility 100 (1s)": "R_100_1S"
+    }
+    symbol = st.selectbox("Market", list(symbols.keys()))
+
+    # Contract type + target digit
+    col1, col2 = st.columns([2,1])
+    with col1:
+        contract_type = st.selectbox(
+            "Contract Type", 
+            ["DIGITMATCH", "DIGITDIFF", "DIGITOVER", "DIGITUNDER", "DIGITODD", "DIGITEVEN", "RISE", "FALL"]
+        )
+    with col2:
+        target_digit = None
+        if contract_type in ["DIGITMATCH", "DIGITDIFF", "DIGITOVER", "DIGITUNDER"]:
+            target_digit = st.number_input("Digit", min_value=0, max_value=9, step=1)
+
+    stake = st.number_input("Stake Amount (USD)", min_value=1.0, value=1.0)
+    bulk_runs = st.slider("Number of Trades per Batch", min_value=1, max_value=10, value=10)
+    continuous = st.checkbox("Continuous Trading (Loop batches)")
+
+    # Status
+    st.subheader("Status")
+    st.metric("Account Balance", f"${st.session_state.balance:,.2f}")
+
+    # Trades table
+    st.subheader("Recent Trades")
+    if len(st.session_state.trades) > 0:
+        st.table(st.session_state.trades[:10])
+    else:
+        st.write("No trades yet...")
+
+    # Start / Stop buttons
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("▶️ Start"):
             threading.Thread(
                 target=run_bot, 
-                args=(api_token, symbols[symbol], contract_type, stake, target_digit, continuous)
+                args=(st.session_state.api_token, symbols[symbol], contract_type, stake, target_digit, continuous, bulk_runs)
             ).start()
-with col2:
-    if st.button("⏹️ Stop"):
-        st.session_state.running = False
+    with col2:
+        if st.button("⏹️ Stop"):
+            st.session_state.running = False
