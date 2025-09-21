@@ -71,7 +71,7 @@ def authorize(ws, token):
 def subscribe_balance(ws):
     ws.send(json.dumps({"balance": 1, "subscribe": 1}))
 
-def send_proposal(ws, symbol, contract_type, stake):
+def send_proposal(ws, symbol, contract_type, stake, target_digit=None):
     proposal = {
         "proposal": 1,
         "amount": stake,
@@ -82,6 +82,8 @@ def send_proposal(ws, symbol, contract_type, stake):
         "duration_unit": "t",
         "symbol": symbol
     }
+    if target_digit is not None:  # Only add barrier if required
+        proposal["barrier"] = str(target_digit)
     ws.send(json.dumps(proposal))
 
 def buy_contract(ws, proposal_id, symbol, contract_type, stake):
@@ -95,7 +97,7 @@ def buy_contract(ws, proposal_id, symbol, contract_type, stake):
         "payout": None
     })
 
-def ws_worker(token, symbol, contract_type, stake):
+def ws_worker(token, symbol, contract_type, stake, target_digit):
     def on_open(ws):
         authorize(ws, token)
 
@@ -108,7 +110,7 @@ def ws_worker(token, symbol, contract_type, stake):
 
         if data.get("msg_type") == "authorize":
             subscribe_balance(ws)
-            send_proposal(ws, symbol, contract_type, stake)
+            send_proposal(ws, symbol, contract_type, stake, target_digit)
 
         if data.get("msg_type") == "balance":
             st.session_state.balance = data["balance"]["balance"]
@@ -140,12 +142,12 @@ def ws_worker(token, symbol, contract_type, stake):
     )
     ws.run_forever()
 
-def run_bot(token, symbol, contract_type, stake, continuous):
+def run_bot(token, symbol, contract_type, stake, target_digit, continuous):
     st.session_state.running = True
     while st.session_state.running:
         threads = []
         for _ in range(10):
-            t = threading.Thread(target=ws_worker, args=(token, symbol, contract_type, stake))
+            t = threading.Thread(target=ws_worker, args=(token, symbol, contract_type, stake, target_digit))
             threads.append(t)
             t.start()
             time.sleep(0.3)
@@ -182,7 +184,19 @@ symbols = {
     "Volatility 100 (1s)": "R_100_1S"
 }
 symbol = st.selectbox("Market", list(symbols.keys()))
-contract_type = st.selectbox("Contract Type", ["DIGITMATCH", "DIGITDIFF", "DIGITODD", "DIGITEVEN", "DIGITOVER", "DIGITUNDER", "RISE", "FALL"])
+
+# Contract type + target digit in same row
+col1, col2 = st.columns([2,1])
+with col1:
+    contract_type = st.selectbox(
+        "Contract Type", 
+        ["DIGITMATCH", "DIGITDIFF", "DIGITOVER", "DIGITUNDER", "DIGITODD", "DIGITEVEN", "RISE", "FALL"]
+    )
+with col2:
+    target_digit = None
+    if contract_type in ["DIGITMATCH", "DIGITDIFF", "DIGITOVER", "DIGITUNDER"]:
+        target_digit = st.number_input("Digit", min_value=0, max_value=9, step=1)
+
 stake = st.number_input("Stake Amount (USD)", min_value=1.0, value=1.0)
 continuous = st.checkbox("Continuous Trading (Loop batches)")
 
@@ -204,7 +218,10 @@ with col1:
         if not api_token:
             st.error("Please enter API token")
         else:
-            threading.Thread(target=run_bot, args=(api_token, symbols[symbol], contract_type, stake, continuous)).start()
+            threading.Thread(
+                target=run_bot, 
+                args=(api_token, symbols[symbol], contract_type, stake, target_digit, continuous)
+            ).start()
 with col2:
     if st.button("⏹️ Stop"):
         st.session_state.running = False
