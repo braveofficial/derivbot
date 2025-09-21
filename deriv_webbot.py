@@ -1,466 +1,166 @@
 # deriv_webbot.py
-# Streamlit MASTER BULK TRADER with live balance display, customizable number of trades per batch, enhanced error reporting, and theme toggle
-# Requirements:
-#   pip install streamlit websocket-client
-
 import streamlit as st
 import websocket
 import json
 import threading
 import time
-import datetime
 
-st.set_page_config(page_title="MASTER BULK TRADER", layout="wide")
+st.set_page_config(page_title="Deriv Bulk Bot", layout="wide")
 
-# ---------------------
-# Session defaults
-# ---------------------
+# ---------------- THEME SWITCH ---------------- #
+def apply_theme(theme: str):
+    if theme == "Dark":
+        st.markdown("""
+            <style>
+                body, .stApp { background-color: #1e1e1e; color: #f5f5f5; }
+                table, th, td { background-color: #2d2d2d !important; color: #f5f5f5 !important; }
+                .stButton button { background-color: #333333; color: #f5f5f5; }
+            </style>
+        """, unsafe_allow_html=True)
+    else:
+        st.markdown("""
+            <style>
+                body, .stApp { background-color: #ffffff; color: #000000; }
+                table, th, td { background-color: #f5f5f5 !important; color: #000000 !important; }
+                .stButton button { background-color: #f0f0f0; color: #000000; }
+            </style>
+        """, unsafe_allow_html=True)
+
+# ---------------- SESSION STATE ---------------- #
 if "running" not in st.session_state:
     st.session_state.running = False
-if "transactions" not in st.session_state:
-    st.session_state.transactions = []
-if "stats" not in st.session_state:
-    st.session_state.stats = {"stake_total": 0.0, "payout_total": 0.0, "wins": 0, "losses": 0, "profit": 0.0}
-if "lock" not in st.session_state:
-    st.session_state.lock = threading.Lock()
-if "theme" not in st.session_state:
-    st.session_state.theme = "light"
 if "balance" not in st.session_state:
-    st.session_state.balance = None
-if "account_currency" not in st.session_state:
-    st.session_state.account_currency = "USD"
-if "balance_error" not in st.session_state:
-    st.session_state.balance_error = ""
+    st.session_state.balance = 0.0
 
-# ---------------------
-# Markets
-# ---------------------
-MARKET_OPTIONS = [
-    ("Volatility 10 Index", "R_10"),
-    ("Volatility 25 Index", "R_25"),
-    ("Volatility 50 Index", "R_50"),
-    ("Volatility 75 Index", "R_75"),
-    ("Volatility 100 Index", "R_100"),
-    ("Volatility 10 (1s) Index", "R_10_1S"),
-    ("Volatility 15 (1s) Index", "R_15_1S"),
-    ("Volatility 25 (1s) Index", "R_25_1S"),
-    ("Volatility 50 (1s) Index", "R_50_1S"),
-    ("Volatility 75 (1s) Index", "R_75_1S"),
-    ("Volatility 90 (1s) Index", "R_90_1S"),
-    ("Volatility 100 (1s) Index", "R_100_1S"),
-]
+# ---------------- DERIV WEBSOCKET ---------------- #
+API_URL = "wss://ws.derivws.com/websockets/v3?app_id=1089"
 
-# ---------------------
-# Theme CSS
-# ---------------------
-LIGHT_CSS = """
-<style>
-body {background-color: #f8f9fb; color: #111;}
-.card { background:#ffffff; border-radius:8px; padding:8px; box-shadow: 0 2px 6px rgba(0,0,0,0.06);}
-.win { color: #0a8f2a; font-weight:600; }
-.loss { color: #c42a2a; font-weight:600; }
-.info { color: #444; }
-.header { font-size:18px; font-weight:700; }
-.small { font-size:12px; color:#666; }
-</style>
-"""
-DARK_CSS = """
-<style>
-body {background-color: #0f1720; color: #e6eef6;}
-.card { background:#0b1220; border-radius:8px; padding:8px; box-shadow: 0 2px 10px rgba(0,0,0,0.6);}
-.win { color: #5eead4; font-weight:600; }
-.loss { color: #fb7185; font-weight:600; }
-.info { color: #94a3b8; }
-.header { font-size:18px; font-weight:700; }
-.small { font-size:12px; color:#94a3b8; }
-</style>
-"""
+def authorize(ws, token):
+    ws.send(json.dumps({"authorize": token}))
 
-def apply_theme():
-    if st.session_state.theme == "light":
-        st.markdown(LIGHT_CSS, unsafe_allow_html=True)
-    else:
-        st.markdown(DARK_CSS, unsafe_allow_html=True)
+def subscribe_balance(ws):
+    ws.send(json.dumps({"balance": 1, "subscribe": 1}))
 
-apply_theme()
+def send_proposal(ws, symbol, contract_type, stake):
+    proposal = {
+        "proposal": 1,
+        "amount": stake,
+        "basis": "stake",
+        "contract_type": contract_type,
+        "currency": "USD",
+        "duration": 1,
+        "duration_unit": "t",
+        "symbol": symbol
+    }
+    ws.send(json.dumps(proposal))
 
-# ---------------------
-# Utilities
-# ---------------------
-def now_ts():
-    return datetime.datetime.now().strftime("%H:%M:%S")
+def buy_contract(ws, proposal_id):
+    ws.send(json.dumps({"buy": proposal_id, "price": 10000}))
 
-def add_transaction(tr):
-    with st.session_state.lock:
-        st.session_state.transactions.append(tr)
-        st.session_state.stats["stake_total"] += float(tr.get("stake", 0) or 0)
-        st.session_state.stats["payout_total"] += float(tr.get("payout", 0) or 0)
-        pl = float(tr.get("pl", 0) or 0)
-        st.session_state.stats["profit"] += pl
-        if pl > 0:
-            st.session_state.stats["wins"] += 1
-        elif pl < 0:
-            st.session_state.stats["losses"] += 1
+def ws_worker(token, symbol, contract_type, stake):
+    def on_open(ws):
+        authorize(ws, token)
 
-# ---------------------
-# Live balance fetcher with error reporting
-# ---------------------
-def fetch_account_balance(api_token, update_interval=3):
+    def on_message(ws, message):
+        data = json.loads(message)
+
+        if "error" in data:
+            st.session_state.running = False
+            return
+
+        if data.get("msg_type") == "authorize":
+            subscribe_balance(ws)
+
+        if data.get("msg_type") == "balance":
+            st.session_state.balance = data["balance"]["balance"]
+
+        if data.get("msg_type") == "proposal":
+            proposal_id = data["proposal"]["id"]
+            buy_contract(ws, proposal_id)
+
+        if data.get("msg_type") == "buy":
+            pass  # Contract bought
+
+        if data.get("msg_type") == "proposal_open_contract":
+            if data["proposal_open_contract"].get("is_sold", False):
+                pass  # Trade completed
+
+    def on_error(ws, error):
+        st.session_state.running = False
+
+    def on_close(ws, close_status_code, close_msg):
+        pass
+
+    websocket.enableTrace(False)
+    ws = websocket.WebSocketApp(
+        API_URL,
+        on_open=on_open,
+        on_message=on_message,
+        on_error=on_error,
+        on_close=on_close
+    )
+    ws.run_forever()
+
+def run_bot(token, symbol, contract_type, stake, continuous):
+    st.session_state.running = True
     while st.session_state.running:
-        try:
-            ws = websocket.WebSocket()
-            ws.settimeout(8)
-            ws.connect("wss://ws.derivws.com/websockets/v3?app_id=1089")
-            auth_req = {"authorize": api_token}
-            ws.send(json.dumps(auth_req))
-            auth_resp_raw = ws.recv()
-            auth_resp = json.loads(auth_resp_raw)
-            if "error" in auth_resp:
-                with st.session_state.lock:
-                    st.session_state.balance = None
-                    st.session_state.balance_error = f"Authorization error: {auth_resp['error'].get('message', str(auth_resp['error']))}"
-                ws.close()
-                time.sleep(update_interval)
-                continue
-            # fetch balance
-            bal_req = {"balance": 1, "currency": "USD"}
-            ws.send(json.dumps(bal_req))
-            bal_resp_raw = ws.recv()
-            bal_resp = json.loads(bal_resp_raw)
-            if "balance" in bal_resp:
-                balance = bal_resp["balance"].get("balance", None)
-                currency = bal_resp["balance"].get("currency", "USD")
-                with st.session_state.lock:
-                    st.session_state.balance = balance
-                    st.session_state.account_currency = currency
-                    st.session_state.balance_error = ""
-            elif "error" in bal_resp:
-                with st.session_state.lock:
-                    st.session_state.balance = None
-                    st.session_state.balance_error = f"Balance error: {bal_resp['error'].get('message', str(bal_resp['error']))}"
-            else:
-                with st.session_state.lock:
-                    st.session_state.balance = None
-                    st.session_state.balance_error = "Unknown error fetching balance."
-            ws.close()
-        except Exception as e:
-            with st.session_state.lock:
-                st.session_state.balance = None
-                st.session_state.balance_error = f"Exception fetching balance: {e}"
-            try:
-                ws.close()
-            except:
-                pass
-        time.sleep(update_interval)
+        threads = []
+        for _ in range(10):  # 10 trades per batch
+            t = threading.Thread(target=ws_worker, args=(token, symbol, contract_type, stake))
+            threads.append(t)
+            t.start()
+            time.sleep(0.3)  # spacing between trades
 
-# ---------------------
-# Trade worker (single trade — one websocket per trade)
-# ---------------------
-def trade_thread(api_token, symbol, contract_type, stake, digit, trade_no, timeout=25):
-    entry = "-"
-    exit_ = "-"
-    payout = 0.0
-    pl = 0.0
-    status = "Unknown"
+        for t in threads:
+            t.join()
 
-    ws = None
-    try:
-        ws = websocket.WebSocket()
-        ws.settimeout(8)
-        ws.connect("wss://ws.derivws.com/websockets/v3?app_id=1089")
-        auth_req = {"authorize": api_token}
-        ws.send(json.dumps(auth_req))
-        auth_resp_raw = ws.recv()
-        auth_resp = json.loads(auth_resp_raw)
-        if "error" in auth_resp:
-            add_transaction({
-                "trade_no": trade_no, "entry": entry, "exit": exit_, "stake": stake,
-                "payout": payout, "pl": pl, "status": f"AuthError: {auth_resp['error']}"
-            })
-            return
+        if not continuous:
+            break
 
-        # Build proposal
-        proposal = {
-            "proposal": 1,
-            "amount": stake,
-            "basis": "stake",
-            "symbol": symbol,
-            "contract_type": contract_type,
-            "currency": "USD",
-            "duration": 1,
-            "duration_unit": "t"
-        }
-        if contract_type in ["DIGITMATCH", "DIGITDIFF", "DIGITOVER", "DIGITUNDER"]:
-            proposal["barrier"] = str(digit)
+# ---------------- UI ---------------- #
+st.title("📈 Deriv Bulk Bot")
 
-        ws.send(json.dumps(proposal))
-        # wait for proposal response
-        proposal_resp = None
-        start = time.time()
-        while time.time() - start < 6:
-            try:
-                raw = ws.recv()
-            except Exception:
-                continue
-            try:
-                msg = json.loads(raw)
-            except Exception:
-                continue
-            if "proposal" in msg:
-                proposal_resp = msg["proposal"]
-                break
-            if "error" in msg:
-                proposal_resp = {"error": msg["error"]}
-                break
+# Theme toggle
+col1, col2 = st.columns([4,1])
+with col2:
+    theme = st.radio("Theme", ["Light", "Dark"], horizontal=True, label_visibility="collapsed")
+    apply_theme(theme)
 
-        if not proposal_resp or "error" in proposal_resp:
-            err = proposal_resp.get("error") if proposal_resp else {"message": "No proposal"}
-            add_transaction({
-                "trade_no": trade_no, "entry": entry, "exit": exit_, "stake": stake,
-                "payout": payout, "pl": pl, "status": f"ProposalError: {err}"
-            })
-            return
+# API & Controls
+st.subheader("Controls")
+api_token = st.text_input("Enter your Deriv API Token", type="password")
 
-        proposal_id = proposal_resp.get("id") or proposal_resp.get("proposal") or proposal_resp.get("proposal_id")
+symbols = {
+    "Volatility 10": "R_10",
+    "Volatility 25": "R_25",
+    "Volatility 50": "R_50",
+    "Volatility 75": "R_75",
+    "Volatility 100": "R_100",
+    "Volatility 10 (1s)": "R_10_1S",
+    "Volatility 15 (1s)": "R_15_1S",
+    "Volatility 25 (1s)": "R_25_1S",
+    "Volatility 50 (1s)": "R_50_1S",
+    "Volatility 75 (1s)": "R_75_1S",
+    "Volatility 90 (1s)": "R_90_1S",
+    "Volatility 100 (1s)": "R_100_1S"
+}
+symbol = st.selectbox("Market", list(symbols.keys()))
+contract_type = st.selectbox("Contract Type", ["DIGITMATCH", "DIGITDIFF", "DIGITODD", "DIGITEVEN", "DIGITOVER", "DIGITUNDER", "RISE", "FALL"])
+stake = st.number_input("Stake Amount (USD)", min_value=1.0, value=1.0)
+continuous = st.checkbox("Continuous Trading (Loop batches)")
 
-        # buy
-        buy_req = {"buy": proposal_id}
-        ws.send(json.dumps(buy_req))
+# Status
+st.subheader("Status")
+st.metric("Account Balance", f"${st.session_state.balance:,.2f}")
 
-        # wait for buy response
-        buy_resp = None
-        start = time.time()
-        contract_id = None
-        while time.time() - start < 6:
-            try:
-                raw = ws.recv()
-            except Exception:
-                continue
-            try:
-                msg = json.loads(raw)
-            except Exception:
-                continue
-            if "buy" in msg:
-                buy_resp = msg["buy"]
-                contract_id = buy_resp.get("contract_id") or buy_resp.get("contract")
-                break
-            if "error" in msg:
-                buy_resp = {"error": msg["error"]}
-                break
-
-        if not buy_resp or "error" in buy_resp:
-            err = buy_resp.get("error") if buy_resp else {"message": "No buy response"}
-            add_transaction({
-                "trade_no": trade_no, "entry": entry, "exit": exit_, "stake": stake,
-                "payout": payout, "pl": pl, "status": f"BuyError: {err}"
-            })
-            return
-
-        # wait for settlement
-        start = time.time()
-        while time.time() - start < timeout:
-            try:
-                raw = ws.recv()
-            except Exception:
-                continue
-            try:
-                msg = json.loads(raw)
-            except Exception:
-                continue
-            if "proposal_open_contract" in msg:
-                poc = msg["proposal_open_contract"]
-                if contract_id and poc.get("contract_id") == contract_id:
-                    buy_price = float(poc.get("buy_price", 0) or 0)
-                    if poc.get("is_sold") or poc.get("status") == "sold":
-                        sell_price = float(poc.get("sell_price", 0) or 0)
-                        payout = sell_price
-                        pl = payout - buy_price
-                        entry = poc.get("entry_tick", "-")
-                        exit_ = poc.get("exit_tick", "-")
-                        status = "Win" if pl > 0 else ("Loss" if pl < 0 else "Even")
-                        break
-            if "contract" in msg:
-                c = msg["contract"]
-                if contract_id and (c.get("contract_id") == contract_id or c.get("id") == contract_id):
-                    buy_price = float(c.get("buy_price", 0) or 0)
-                    sell_price = float(c.get("sell_price", 0) or 0)
-                    payout = sell_price
-                    pl = payout - buy_price
-                    entry = c.get("entry_tick", "-")
-                    exit_ = c.get("exit_tick", "-")
-                    status = "Win" if pl > 0 else ("Loss" if pl < 0 else "Even")
-                    break
-            if "sell" in msg:
-                s = msg["sell"]
-                payout = float(s.get("sell_price", s.get("profit", 0)) or 0)
-                pl = payout
-                status = "Win" if pl > 0 else ("Loss" if pl < 0 else "Even")
-                break
-
-        if status == "Unknown":
-            add_transaction({
-                "trade_no": trade_no, "entry": entry, "exit": exit_, "stake": stake,
-                "payout": payout, "pl": pl, "status": "NoSettlement"
-            })
-            return
-
-        # final record
-        add_transaction({
-            "trade_no": trade_no, "entry": entry, "exit": exit_, "stake": stake,
-            "payout": payout, "pl": pl, "status": status
-        })
-
-    except Exception as e:
-        add_transaction({
-            "trade_no": trade_no, "entry": entry, "exit": exit_, "stake": stake,
-            "payout": payout, "pl": pl, "status": f"Exception:{e}"
-        })
-    finally:
-        try:
-            if ws:
-                ws.close()
-        except:
-            pass
-
-# ---------------------
-# Bulk batch runner (custom trades) -> spawns batch_size threads
-# ---------------------
-def run_bulk_batch(api_token, symbol, contract_type, stake, digit, batch_size):
-    threads = []
-    timestamp = now_ts()
-    add_transaction({"trade_no": f"BatchStart_{timestamp}", "entry":"-","exit":"-","stake":0,"payout":0,"pl":0,"status":f"Starting batch @ {timestamp}"})
-    for i in range(1, batch_size + 1):
-        t = threading.Thread(target=trade_thread, args=(api_token, symbol, contract_type, stake, digit, i), daemon=True)
-        t.start()
-        threads.append(t)
-        time.sleep(0.02)
-    for t in threads:
-        t.join(timeout=40)
-    add_transaction({"trade_no":"BatchEnd", "entry":"-","exit":"-","stake":0,"payout":0,"pl":0,"status":f"Batch finished @ {now_ts()}"})
-
-# ---------------------
-# Continuous runner
-# ---------------------
-def continuous_runner(api_token, symbol, contract_type, stake, digit, batch_size):
-    batch_no = 0
-    while st.session_state.running:
-        batch_no += 1
-        run_bulk_batch(api_token, symbol, contract_type, stake, digit, batch_size)
-        time.sleep(0.8)
-    add_transaction({"trade_no":"System", "entry":"-","exit":"-","stake":0,"payout":0,"pl":0,"status":"Stopped continuous runner"})
-
-# ---------------------
-# UI
-# ---------------------
-def main_ui():
-    # header + theme toggle
-    header_col1, header_col2 = st.columns([6,1])
-    with header_col1:
-        st.title("💎 MASTER BULK TRADER")
-    with header_col2:
-        theme_choice = st.radio("Theme", ("Light","Dark"), index=0 if st.session_state.theme=="light" else 1, horizontal=True)
-        if theme_choice.lower() != st.session_state.theme:
-            st.session_state.theme = theme_choice.lower()
-            apply_theme()
-
-    # layout
-    left, center, right = st.columns([1,1.1,1.6])
-
-    # left: controls
-    with left:
-        st.subheader("⚙️ Controls")
-        api_token = st.text_input("🔑 API Token", type="password")
-        market_label = st.selectbox("📈 Volatility Market", [m[0] for m in MARKET_OPTIONS])
-        default_symbol = dict(MARKET_OPTIONS)[market_label]
-        custom_symbol = st.text_input("Symbol override (optional)", value=default_symbol)
-        contract_type = st.selectbox("Contract Type", ["DIGITMATCH","DIGITDIFF","DIGITOVER","DIGITUNDER","DIGITEVEN","DIGITODD"])
-        stake = st.number_input("Stake (USD)", min_value=0.35, value=1.0, step=0.1)
-        if contract_type in ["DIGITMATCH","DIGITDIFF","DIGITOVER","DIGITUNDER"]:
-            digit = st.number_input("Digit (0-9)", min_value=0, max_value=9, value=5, step=1)
+# Start / Stop
+col1, col2 = st.columns(2)
+with col1:
+    if st.button("▶️ Start"):
+        if not api_token:
+            st.error("Please enter API token")
         else:
-            digit = 0
-        batch_size = st.number_input("Number of trades per batch", min_value=1, max_value=100, value=10, step=1)
-        continuous = st.checkbox("Repeat batches until STOP", value=True)
-        st.markdown(f"Note: Each batch fires {batch_size} trades (parallel). Use demo token for testing.")
-
-        # Start / Stop
-        if not st.session_state.running:
-            if st.button(f"▶️ Start (Bulk {batch_size})"):
-                if not api_token:
-                    st.error("Please enter API token")
-                else:
-                    with st.session_state.lock:
-                        st.session_state.transactions = []
-                        st.session_state.stats = {"stake_total": 0.0, "payout_total": 0.0, "wins": 0, "losses": 0, "profit": 0.0}
-                        st.session_state.running = True
-                        st.session_state.balance_error = ""
-                    # Start balance fetcher thread
-                    threading.Thread(target=fetch_account_balance, args=(api_token,), daemon=True).start()
-                    # Start trading thread
-                    if continuous:
-                        threading.Thread(target=continuous_runner, args=(api_token, custom_symbol, contract_type, stake, digit, batch_size), daemon=True).start()
-                    else:
-                        threading.Thread(target=run_bulk_batch, args=(api_token, custom_symbol, contract_type, stake, digit, batch_size), daemon=True).start()
-        else:
-            if st.button("⏹️ Stop"):
-                st.session_state.running = False
-
-    # center: status + recent messages + live balance
-    with center:
-        st.subheader("🤖 Bot Status")
-        if st.session_state.running:
-            st.success("Bot is running (bulk batches)...")
-        else:
-            st.info("Bot is stopped.")
-
-        # Show live balance & errors
-        balance = st.session_state.get("balance", None)
-        account_currency = st.session_state.get("account_currency", "USD")
-        balance_error = st.session_state.get("balance_error", "")
-        if balance_error:
-            st.error(balance_error)
-        elif balance is not None:
-            st.metric("Account Balance", f"{account_currency} {balance:,.2f}")
-        else:
-            st.warning("Balance unavailable. Enter valid API token and start bot.")
-
-        st.markdown("**Live actions / last messages**")
-        recent = st.session_state.transactions[-6:] if st.session_state.transactions else []
-        for item in reversed(recent):
-            text = f"{item.get('trade_no')} | {item.get('status')} | P/L: {item.get('pl',0):+.2f}"
-            if item.get("pl", 0) > 0:
-                st.markdown(f"<div class='card win'>{now_ts()} {text}</div>", unsafe_allow_html=True)
-            elif item.get("pl", 0) < 0:
-                st.markdown(f"<div class='card loss'>{now_ts()} {text}</div>", unsafe_allow_html=True)
-            else:
-                st.markdown(f"<div class='card info'>{now_ts()} {text}</div>", unsafe_allow_html=True)
-
-    # right: transactions list + session summary
-    with right:
-        st.subheader("📜 Transactions (session)")
-        if not st.session_state.transactions:
-            st.info("No trades yet.")
-        else:
-            for t in reversed(st.session_state.transactions):
-                cls = "win" if t.get("pl",0) > 0 else ("loss" if t.get("pl",0) < 0 else "info")
-                st.markdown(
-                    f"<div class='card'>"
-                    f"<b>#{t.get('trade_no')}</b> &nbsp; <span class='{cls}'>{t.get('status')}</span><br>"
-                    f"Stake: {t.get('stake')} &nbsp; Payout: {t.get('payout')} &nbsp; P/L: <span class='{cls}'>{t.get('pl'):+.2f}</span><br>"
-                    f"Entry: {t.get('entry')} &nbsp; Exit: {t.get('exit')}"
-                    f"</div>", unsafe_allow_html=True)
-
-    # bottom summary
-    st.markdown("---")
-    st.subheader("📊 Session Summary")
-    s = st.session_state.stats
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Total Stake", f"${s['stake_total']:.2f}")
-    c2.metric("Total Payout", f"${s['payout_total']:.2f}")
-    c3.metric("Wins", s["wins"])
-    c4.metric("Losses", s["losses"])
-    c5.metric("Profit/Loss", f"${s['profit']:.2f}")
-
-# run
-if __name__ == "__main__":
-    main_ui()
+            threading.Thread(target=run_bot, args=(api_token, symbols[symbol], contract_type, stake, continuous)).start()
+with col2:
+    if st.button("⏹️ Stop"):
+        st.session_state.running = False
