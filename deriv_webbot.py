@@ -1,28 +1,56 @@
-# deriv_webbot.py
+# master_bulk_trader.py
 import streamlit as st
 import websocket
 import json
 import threading
 import time
+from datetime import datetime
 
-st.set_page_config(page_title="Deriv Bulk Bot", layout="wide")
+st.set_page_config(page_title="MASTER BULK TRADER", layout="wide")
 
 # ---------------- THEME SWITCH ---------------- #
-def apply_theme(theme: str):
+def apply_theme(theme: str, running: bool):
+    # Dynamic background: Green if running, Blue if stopped
+    bg_color = "#064635" if running else "#002B5B"
+
     if theme == "Dark":
-        st.markdown("""
+        st.markdown(f"""
             <style>
-                body, .stApp { background-color: #1e1e1e; color: #f5f5f5; }
-                table, th, td { background-color: #2d2d2d !important; color: #f5f5f5 !important; }
-                .stButton button { background-color: #333333; color: #f5f5f5; }
+                body, .stApp {{
+                    background-color: {bg_color};
+                    color: #f5f5f5;
+                    font-family: 'Segoe UI', sans-serif;
+                }}
+                table, th, td {{
+                    background-color: #1e1e1e !important;
+                    color: #f5f5f5 !important;
+                }}
+                .stButton button {{
+                    background-color: #333333;
+                    color: #ffffff;
+                    border-radius: 8px;
+                    font-weight: bold;
+                }}
             </style>
         """, unsafe_allow_html=True)
-    else:
-        st.markdown("""
+    else:  # Light mode
+        st.markdown(f"""
             <style>
-                body, .stApp { background-color: #ffffff; color: #000000; }
-                table, th, td { background-color: #f5f5f5 !important; color: #000000 !important; }
-                .stButton button { background-color: #f0f0f0; color: #000000; }
+                body, .stApp {{
+                    background-color: {bg_color};
+                    color: #000000;
+                    font-family: 'Segoe UI', sans-serif;
+                }}
+                table, th, td {{
+                    background-color: #ffffff !important;
+                    color: #000000 !important;
+                }}
+                .stButton button {{
+                    background-color: #e0e0e0;
+                    color: #000000;
+                    border-radius: 8px;
+                    font-weight: bold;
+                }}
             </style>
         """, unsafe_allow_html=True)
 
@@ -31,6 +59,8 @@ if "running" not in st.session_state:
     st.session_state.running = False
 if "balance" not in st.session_state:
     st.session_state.balance = 0.0
+if "trades" not in st.session_state:
+    st.session_state.trades = []
 
 # ---------------- DERIV WEBSOCKET ---------------- #
 API_URL = "wss://ws.derivws.com/websockets/v3?app_id=1089"
@@ -54,8 +84,16 @@ def send_proposal(ws, symbol, contract_type, stake):
     }
     ws.send(json.dumps(proposal))
 
-def buy_contract(ws, proposal_id):
+def buy_contract(ws, proposal_id, symbol, contract_type, stake):
     ws.send(json.dumps({"buy": proposal_id, "price": 10000}))
+    st.session_state.trades.insert(0, {
+        "time": datetime.now().strftime("%H:%M:%S"),
+        "symbol": symbol,
+        "contract": contract_type,
+        "stake": stake,
+        "status": "Open",
+        "payout": None
+    })
 
 def ws_worker(token, symbol, contract_type, stake):
     def on_open(ws):
@@ -70,34 +108,35 @@ def ws_worker(token, symbol, contract_type, stake):
 
         if data.get("msg_type") == "authorize":
             subscribe_balance(ws)
+            send_proposal(ws, symbol, contract_type, stake)
 
         if data.get("msg_type") == "balance":
             st.session_state.balance = data["balance"]["balance"]
 
         if data.get("msg_type") == "proposal":
             proposal_id = data["proposal"]["id"]
-            buy_contract(ws, proposal_id)
-
-        if data.get("msg_type") == "buy":
-            pass  # Contract bought
+            buy_contract(ws, proposal_id, symbol, contract_type, stake)
 
         if data.get("msg_type") == "proposal_open_contract":
-            if data["proposal_open_contract"].get("is_sold", False):
-                pass  # Trade completed
+            poc = data["proposal_open_contract"]
+            if poc.get("is_sold", False):
+                pnl = poc.get("profit", 0.0)
+                status = "Won ✅" if pnl > 0 else "Lost ❌"
+                for trade in st.session_state.trades:
+                    if trade["status"] == "Open":
+                        trade["status"] = status
+                        trade["payout"] = pnl
+                        break
 
     def on_error(ws, error):
         st.session_state.running = False
-
-    def on_close(ws, close_status_code, close_msg):
-        pass
 
     websocket.enableTrace(False)
     ws = websocket.WebSocketApp(
         API_URL,
         on_open=on_open,
         on_message=on_message,
-        on_error=on_error,
-        on_close=on_close
+        on_error=on_error
     )
     ws.run_forever()
 
@@ -105,26 +144,24 @@ def run_bot(token, symbol, contract_type, stake, continuous):
     st.session_state.running = True
     while st.session_state.running:
         threads = []
-        for _ in range(10):  # 10 trades per batch
+        for _ in range(10):
             t = threading.Thread(target=ws_worker, args=(token, symbol, contract_type, stake))
             threads.append(t)
             t.start()
-            time.sleep(0.3)  # spacing between trades
-
+            time.sleep(0.3)
         for t in threads:
             t.join()
-
         if not continuous:
             break
 
 # ---------------- UI ---------------- #
-st.title("📈 Deriv Bulk Bot")
+st.title("🤖 MASTER BULK TRADER")
 
 # Theme toggle
 col1, col2 = st.columns([4,1])
 with col2:
     theme = st.radio("Theme", ["Light", "Dark"], horizontal=True, label_visibility="collapsed")
-    apply_theme(theme)
+apply_theme(theme, st.session_state.running)
 
 # API & Controls
 st.subheader("Controls")
@@ -152,6 +189,13 @@ continuous = st.checkbox("Continuous Trading (Loop batches)")
 # Status
 st.subheader("Status")
 st.metric("Account Balance", f"${st.session_state.balance:,.2f}")
+
+# Trades table
+st.subheader("Recent Trades")
+if len(st.session_state.trades) > 0:
+    st.table(st.session_state.trades[:10])
+else:
+    st.write("No trades yet...")
 
 # Start / Stop
 col1, col2 = st.columns(2)
