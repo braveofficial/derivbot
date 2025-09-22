@@ -3,10 +3,9 @@ import websocket
 import json
 import threading
 import time
-from urllib.parse import urlparse, parse_qs
 
 # --- SETTINGS ---
-APP_ID = 102924  # your deriv app id
+APP_ID = 102924  # your Deriv app id
 MARKET = "R_50"
 TRADE_TYPE = "DIGITMATCH"
 SYMBOL = "R_50"
@@ -25,36 +24,37 @@ if "trades" not in st.session_state:
 if "bulk_runs" not in st.session_state:
     st.session_state.bulk_runs = 5  # default 5 trades
 
-# --- DASHBOARD ---
+# --- DASHBOARD HEADER ---
 st.title("📈 MASTER BULK TRADER")
 
 # --- ACCOUNT CONNECTION ---
 st.subheader("Account Connection")
-query_params = st.experimental_get_query_params()
 
-# Handle OAuth redirect
+query_params = st.query_params  # updated (no more experimental warning)
+
+# Handle login
 if "token" in query_params:
-    st.session_state.api_token = query_params["token"][0]
-
-# Show login / logout
-if st.session_state.api_token:
+    st.session_state.api_token = query_params["token"]
     st.success("✅ Connected to Deriv successfully!")
+
+# Show login or logout
+if st.session_state.api_token:
     st.info("🔐 You are connected to your Deriv account.")
     if st.button("🚪 Disconnect"):
         st.session_state.api_token = None
         st.session_state.running = False
         st.session_state.balance = 0.0
         st.session_state.trades = []
-        st.experimental_set_query_params()  # Clear token
-        st.warning("You have been logged out.")
+        st.query_params.clear()  # clear token from URL
+        st.warning("You have been logged out. Please reconnect.")
 else:
-    # Nothing on dashboard until login
+    # Only show Connect button if not logged in
     oauth_url = (
         f"https://oauth.deriv.com/oauth2/authorize?"
         f"app_id={APP_ID}&scope=read,trade&redirect_uri=https://master-bulk-trader.streamlit.app/"
     )
     st.markdown(f"[🔗 Connect with Deriv]({oauth_url})", unsafe_allow_html=True)
-    st.stop()  # stop app here until login
+    st.stop()  # stop rendering dashboard until logged in
 
 # --- BOT LOGIC ---
 def run_bot(token, bulk_runs):
